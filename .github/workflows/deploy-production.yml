@@ -1,0 +1,581 @@
+name: 🚀 Production Deployment - Blue-Green Multi-Cluster
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/**'
+      - 'helm/**'
+      - '.github/workflows/deploy-production.yml'
+  workflow_dispatch:
+    inputs:
+      service:
+        description: 'Service to deploy'
+        required: true
+        type: choice
+        options:
+          - notification-service
+          - search-suggestion-service
+          - catalog-service
+          - report-aggregator-service
+          - content-service
+          - order-service
+          - payment-service
+      version:
+        description: 'Version tag (leave empty for auto)'
+        required: false
+        type: string
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  HELM_VERSION: v3.13.0
+  KUBECTL_VERSION: v1.28.0
+
+jobs:
+  # ============================================
+  # JOB 1: Build & Test
+  # ============================================
+  
+  build-and-test:
+    name: 🏗️ Build, Test & Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+    
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
+      image_digest: ${{ steps.build.outputs.digest }}
+      version: ${{ steps.version.outputs.version }}
+    
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for semantic versioning
+      
+      - name: 🏷️ Generate version
+        id: version
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            # Auto-generate: v{major}.{minor}.{patch}-{short-sha}
+            VERSION="v1.0.${GITHUB_RUN_NUMBER}-${GITHUB_SHA::8}"
+          fi
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "📦 Version: ${VERSION}"
+      
+      - name: 🐳 Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: 🔐 Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: 🏷️ Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/order-service
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix={{branch}}-
+            type=raw,value=${{ steps.version.outputs.version }}
+            type=raw,value=latest,enable={{is_default_branch}}
+      
+      - name: 🧪 Run unit tests
+        run: |
+          echo "disini step untuk testing, dibawah contoh menggunakan npm"
+          cd src/order-service
+          npm install
+          npm run test:unit
+          npm run test:coverage
+      
+      - name: 📊 Upload coverage
+        uses: codecov/codecov-action@v3
+        with:
+          files: ./src/order-service/coverage/lcov.info
+          flags: unittests
+          fail_ci_if_error: true
+      
+      - name: 🏗️ Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: ./src/order-service
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            VERSION=${{ steps.version.outputs.version }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            VCS_REF=${{ github.sha }}
+      
+      - name: 🔍 Scan image with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.meta.outputs.tags }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'  # Fail on critical/high vulnerabilities
+      
+      - name: 📤 Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+      
+      - name: 🔍 Scan image with Grype
+        uses: anchore/scan-action@v3
+        with:
+          image: ${{ steps.meta.outputs.tags }}
+          fail-build: true
+          severity-cutoff: high
+      
+      - name: 📝 Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.meta.outputs.tags }}
+          format: cyclonedx-json
+          output-file: sbom.json
+      
+      - name: 📤 Upload SBOM artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: sbom
+          path: sbom.json
+
+  # ============================================
+  # JOB 2: Policy Validation
+  # ============================================
+  
+  policy-validation:
+    name: 🛡️ Policy Validation (OPA/Conftest)
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+      
+      - name: 🔧 Setup Conftest
+        run: |
+          wget https://github.com/open-policy-agent/conftest/releases/download/v0.45.0/conftest_0.45.0_Linux_x86_64.tar.gz
+          tar xzf conftest_0.45.0_Linux_x86_64.tar.gz
+          sudo mv conftest /usr/local/bin/
+      
+      - name: 🧪 Test OPA policies
+        run: |
+          cd policies/opa
+          conftest verify --policy .
+      
+      - name: 🔍 Validate Kubernetes manifests
+        run: |
+          # Render Helm templates
+          helm template nusantaramart ./helm/nusantaramart-app \
+            --set image.tag=${{ needs.build-and-test.outputs.version }} \
+            > rendered-manifests.yaml
+          
+          # Validate with Conftest
+          conftest test rendered-manifests.yaml \
+            --policy ./policies/opa/deployment-policy.rego \
+            --policy ./policies/opa/security-policy.rego
+      
+      - name: ✅ Policy validation passed
+        run: echo "🎉 All policy checks passed!"
+
+  # ============================================
+  # JOB 3: Deploy to Regional Clusters (Bandung & Surabaya)
+  # ============================================
+  
+  deploy-regional:
+    name: 🌏 Deploy to Regional Clusters (Blue-Green)
+    needs: [build-and-test, policy-validation]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        cluster: [bandung, surabaya]
+      max-parallel: 2  # Deploy both regions in parallel
+    
+    environment:
+      name: production-regional-${{ matrix.cluster }}
+      url: https://api-${{ matrix.cluster }}.nusantaramart.com
+    
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+      
+      - name: 🔧 Configure kubectl for ${{ matrix.cluster }}
+        run: |
+          aws eks update-kubeconfig \
+            --region ap-southeast-1 \
+            --name nusantaramart-${{ matrix.cluster }} \
+            --alias ${{ matrix.cluster }}
+          kubectl config use-context ${{ matrix.cluster }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      
+      - name: 🔧 Install Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: ${{ env.HELM_VERSION }}
+      
+      - name: 🔍 Check current deployment color
+        id: current_color
+        run: |
+          # Get current active color
+          CURRENT=$(kubectl get service order-service -n production \
+            -o jsonpath='{.spec.selector.version}' || echo "blue")
+          
+          # Determine new color
+          if [ "$CURRENT" = "blue" ]; then
+            NEW_COLOR="green"
+          else
+            NEW_COLOR="blue"
+          fi
+          
+          echo "current=$CURRENT" >> $GITHUB_OUTPUT
+          echo "new=$NEW_COLOR" >> $GITHUB_OUTPUT
+          echo "📊 Current: $CURRENT → New: $NEW_COLOR"
+      
+      - name: 🚀 Deploy ${{ steps.current_color.outputs.new }} version
+        run: |
+          NEW_COLOR="${{ steps.current_color.outputs.new }}"
+          
+          helm upgrade --install order-service-${NEW_COLOR} ./helm/nusantaramart-app \
+            --namespace production \
+            --create-namespace \
+            --values ./helm/nusantaramart-app/values-${{ matrix.cluster }}.yaml \
+            --set image.tag=${{ needs.build-and-test.outputs.version }} \
+            --set deployment.color=${NEW_COLOR} \
+            --set replicaCount=4 \
+            --wait \
+            --timeout=10m
+      
+      - name: 🏥 Health check ${{ steps.current_color.outputs.new }} deployment
+        run: |
+          NEW_COLOR="${{ steps.current_color.outputs.new }}"
+          
+          # Wait for rollout
+          kubectl rollout status deployment/order-service-${NEW_COLOR} \
+            -n production \
+            --timeout=5m
+          
+          # Check pod health
+          kubectl wait --for=condition=ready pod \
+            -l app=order-service,version=${NEW_COLOR} \
+            -n production \
+            --timeout=5m
+      
+      - name: 🧪 Run smoke tests on ${{ steps.current_color.outputs.new }}
+        run: |
+          NEW_COLOR="${{ steps.current_color.outputs.new }}"
+          
+          # Get service endpoint (internal)
+          ENDPOINT=$(kubectl get svc order-service-${NEW_COLOR} -n production \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          
+          # Health check
+          curl -f http://${ENDPOINT}:8080/health || exit 1
+          
+          # Basic API test
+          curl -f http://${ENDPOINT}:8080/api/v1/orders || exit 1
+          
+          echo "✅ Smoke tests passed"
+      
+      - name: 📊 Monitor metrics for 5 minutes
+        run: |
+          echo "⏳ Monitoring ${{ steps.current_color.outputs.new }} deployment for 5 minutes..."
+          sleep 300
+          
+          # Check SLO metrics
+          ./scripts/check-slo.sh \
+            --namespace production \
+            --deployment order-service-${{ steps.current_color.outputs.new }} \
+            --duration 5m
+      
+      - name: ↔️ Traffic shift to ${{ steps.current_color.outputs.new }} (10% → 50% → 100%)
+        run: |
+          NEW_COLOR="${{ steps.current_color.outputs.new }}"
+          OLD_COLOR="${{ steps.current_color.outputs.current }}"
+          
+          echo "🔄 Phase 1: Route 10% traffic to ${NEW_COLOR}"
+          ./scripts/traffic-shift.sh \
+            --namespace production \
+            --service order-service \
+            --new-version ${NEW_COLOR} \
+            --old-version ${OLD_COLOR} \
+            --weight 10
+          
+          sleep 180  # Monitor for 3 minutes
+          
+          # Check metrics
+          if ! ./scripts/check-slo.sh --deployment order-service-${NEW_COLOR} --duration 3m; then
+            echo "❌ SLO breach detected at 10%! Rolling back..."
+            exit 1
+          fi
+          
+          echo "🔄 Phase 2: Route 50% traffic to ${NEW_COLOR}"
+          ./scripts/traffic-shift.sh \
+            --service order-service \
+            --new-version ${NEW_COLOR} \
+            --weight 50
+          
+          sleep 300  # Monitor for 5 minutes
+          
+          if ! ./scripts/check-slo.sh --deployment order-service-${NEW_COLOR} --duration 5m; then
+            echo "❌ SLO breach at 50%! Rolling back..."
+            exit 1
+          fi
+          
+          echo "🔄 Phase 3: Route 100% traffic to ${NEW_COLOR}"
+          ./scripts/traffic-shift.sh \
+            --service order-service \
+            --new-version ${NEW_COLOR} \
+            --weight 100
+          
+          sleep 300  # Final monitoring
+          
+          if ! ./scripts/check-slo.sh --deployment order-service-${NEW_COLOR} --duration 5m; then
+            echo "❌ SLO breach at 100%! Rolling back..."
+            exit 1
+          fi
+          
+          echo "✅ Traffic shift completed successfully"
+      
+      - name: 🧹 Cleanup old ${{ steps.current_color.outputs.current }} deployment
+        run: |
+          OLD_COLOR="${{ steps.current_color.outputs.current }}"
+          
+          # Scale down old deployment
+          kubectl scale deployment order-service-${OLD_COLOR} \
+            --replicas=0 \
+            -n production
+          
+          # Wait 10 minutes before deletion (safety buffer)
+          echo "⏳ Waiting 10 minutes before deleting old deployment..."
+          sleep 600
+          
+          # Delete old deployment
+          helm uninstall order-service-${OLD_COLOR} -n production || true
+          
+          echo "🗑️ Old ${OLD_COLOR} deployment cleaned up"
+      
+      - name: 🔄 Update deployment tags
+        run: |
+          NEW_COLOR="${{ steps.current_color.outputs.new }}"
+          
+          kubectl label deployment order-service-${NEW_COLOR} \
+            active=true \
+            version=${{ needs.build-and-test.outputs.version }} \
+            -n production \
+            --overwrite
+      
+      - name: ❌ Rollback on failure
+        if: failure()
+        run: |
+          echo "❌ Deployment failed! Rolling back to ${{ steps.current_color.outputs.current }}"
+          
+          OLD_COLOR="${{ steps.current_color.outputs.current }}"
+          NEW_COLOR="${{ steps.current_color.outputs.new }}"
+          
+          # Route 100% back to old version
+          ./scripts/traffic-shift.sh \
+            --service order-service \
+            --new-version ${OLD_COLOR} \
+            --weight 100
+          
+          # Scale down failed deployment
+          kubectl scale deployment order-service-${NEW_COLOR} \
+            --replicas=0 \
+            -n production
+          
+          # Send alert
+          curl -X POST ${{ secrets.SLACK_WEBHOOK_URL }} \
+            -H 'Content-Type: application/json' \
+            -d '{
+              "text": "🚨 Deployment FAILED in ${{ matrix.cluster }}",
+              "blocks": [{
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "*Deployment Failed*\nCluster: ${{ matrix.cluster }}\nVersion: ${{ needs.build-and-test.outputs.version }}\nRolled back to: '"${OLD_COLOR}"'"
+                }
+              }]
+            }'
+
+  # ============================================
+  # JOB 4: Deploy to Main Cluster (Jakarta)
+  # ============================================
+  
+  deploy-main:
+    name: 🏢 Deploy to Main Cluster (Jakarta)
+    needs: [build-and-test, policy-validation, deploy-regional]
+    runs-on: ubuntu-latest
+    
+    environment:
+      name: production-main-jakarta
+      url: https://api.nusantaramart.com
+    
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+      
+      - name: ⏸️ Manual approval checkpoint
+        uses: trstringer/manual-approval@v1
+        with:
+          secret: ${{ github.TOKEN }}
+          approvers: platform-team,devops-leads
+          minimum-approvals: 2
+          issue-title: "🚀 Deploy to Jakarta Main Cluster"
+          issue-body: |
+            ## Deployment Request
+            
+            **Version:** ${{ needs.build-and-test.outputs.version }}
+            **Image:** ${{ needs.build-and-test.outputs.image_tag }}
+            **Regional Status:** ✅ Bandung & Surabaya deployed successfully
+            
+            **Pre-deployment Checklist:**
+            - [ ] Regional deployments stable for 15+ minutes
+            - [ ] No active incidents
+            - [ ] Monitoring dashboards reviewed
+            - [ ] On-call team notified
+            
+            **Approve to proceed with Jakarta deployment.**
+      
+      - name: 🔧 Configure kubectl for Jakarta
+        run: |
+          aws eks update-kubeconfig \
+            --region ap-southeast-3 \
+            --name nusantaramart-jakarta \
+            --alias jakarta
+          kubectl config use-context jakarta
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      
+      - name: 🔧 Install Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: ${{ env.HELM_VERSION }}
+      
+      - name: 🔍 Check current deployment color
+        id: current_color
+        run: |
+          CURRENT=$(kubectl get service order-service -n production \
+            -o jsonpath='{.spec.selector.version}' || echo "blue")
+          
+          if [ "$CURRENT" = "blue" ]; then
+            NEW_COLOR="green"
+          else
+            NEW_COLOR="blue"
+          fi
+          
+          echo "current=$CURRENT" >> $GITHUB_OUTPUT
+          echo "new=$NEW_COLOR" >> $GITHUB_OUTPUT
+          echo "📊 Jakarta - Current: $CURRENT → New: $NEW_COLOR"
+      
+      - name: 🚀 Deploy ${{ steps.current_color.outputs.new }} version (Jakarta)
+        run: |
+          NEW_COLOR="${{ steps.current_color.outputs.new }}"
+          
+          helm upgrade --install order-service-${NEW_COLOR} ./helm/nusantaramart-app \
+            --namespace production \
+            --create-namespace \
+            --values ./helm/nusantaramart-app/values-jakarta.yaml \
+            --set image.tag=${{ needs.build-and-test.outputs.version }} \
+            --set deployment.color=${NEW_COLOR} \
+            --set replicaCount=6 \
+            --wait \
+            --timeout=10m
+      
+      - name: 🏥 Health check
+        run: |
+          NEW_COLOR="${{ steps.current_color.outputs.new }}"
+          
+          kubectl rollout status deployment/order-service-${NEW_COLOR} -n production --timeout=5m
+          kubectl wait --for=condition=ready pod \
+            -l app=order-service,version=${NEW_COLOR} \
+            -n production \
+            --timeout=5m
+      
+      - name: 🧪 Run smoke tests
+        run: |
+          NEW_COLOR="${{ steps.current_color.outputs.new }}"
+          ENDPOINT=$(kubectl get svc order-service-${NEW_COLOR} -n production \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          
+          curl -f http://${ENDPOINT}:8080/health || exit 1
+          ./scripts/smoke-test.sh ${ENDPOINT}
+      
+      - name: 📊 Monitor metrics for 10 minutes
+        run: |
+          echo "⏳ Monitoring deployment for 10 minutes..."
+          sleep 600
+          ./scripts/check-slo.sh \
+            --deployment order-service-${{ steps.current_color.outputs.new }} \
+            --duration 10m
+      
+      - name: ↔️ Gradual traffic shift (10% → 25% → 50% → 75% → 100%)
+        run: |
+          NEW_COLOR="${{ steps.current_color.outputs.new }}"
+          OLD_COLOR="${{ steps.current_color.outputs.current }}"
+          
+          for WEIGHT in 10 25 50 75 100; do
+            echo "🔄 Shifting ${WEIGHT}% traffic to ${NEW_COLOR}"
+            
+            ./scripts/traffic-shift.sh \
+              --service order-service \
+              --new-version ${NEW_COLOR} \
+              --weight ${WEIGHT}
+            
+            # Wait time proportional to weight
+            WAIT_TIME=$((WEIGHT * 3))
+            echo "⏳ Monitoring for ${WAIT_TIME} seconds..."
+            sleep ${WAIT_TIME}
+            
+            # Check SLO
+            if ! ./scripts/check-slo.sh \
+              --deployment order-service-${NEW_COLOR} \
+              --duration ${WAIT_TIME}s; then
+              echo "❌ SLO breach at ${WEIGHT}%! Rolling back..."
+              exit 1
+            fi
+            
+            echo "✅ ${WEIGHT}% traffic shift successful"
+          done
+      
+      - name: 🧹 Cleanup old deployment
+        run: |
+          OLD_COLOR="${{ steps.current_color.outputs.current }}"
+          kubectl scale deployment order-service-${OLD_COLOR} --replicas=0 -n production
+          sleep 600
+          helm uninstall order-service-${OLD_COLOR} -n production || true
+      
+      - name: ✅ Deployment successful
+        run: |
+          echo "🎉 Deployment to all clusters completed successfully!"
+          
+          curl -X POST ${{ secrets.SLACK_WEBHOOK_URL }} \
+            -H 'Content-Type: application/json' \
+            -d '{
+              "text": "✅ Production deployment successful!",
+              "blocks": [{
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "*Deployment Successful*\nVersion: ${{ needs.build-and-test.outputs.version }}\nClusters: Jakarta, Bandung, Surabaya\nColor: ${{ steps.current_color.outputs.new }}"
+                }
+              }]
+            }'

@@ -1,0 +1,8 @@
+{{- define "nusantaramart-app.configmap" -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "nusantaramart-app.fullname" . }}
+data:
+  ...
+{{- end }}

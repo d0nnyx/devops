@@ -1,0 +1,208 @@
+name: 🔙 Emergency Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster:
+        description: 'Target cluster'
+        required: true
+        type: choice
+        options:
+          - all
+          - jakarta
+          - bandung
+          - surabaya
+      revision:
+        description: 'Helm revision (leave empty for previous)'
+        required: false
+        type: string
+      reason:
+        description: 'Rollback reason'
+        required: true
+        type: string
+
+jobs:
+  rollback:
+    name: 🔙 Rollback ${{ inputs.cluster }}
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+      
+      - name: 🚨 Send alert - Rollback initiated
+        run: |
+          curl -X POST ${{ secrets.SLACK_WEBHOOK_URL }} \
+            -H 'Content-Type: application/json' \
+            -d '{
+              "text": "⚠️ ROLLBACK INITIATED",
+              "blocks": [{
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "*Rollback Started*\nCluster: ${{ inputs.cluster }}\nReason: ${{ inputs.reason }}\nTriggered by: ${{ github.actor }}"
+                }
+              }]
+            }'
+      
+      - name: 🔧 Setup kubectl
+        run: |
+          if [ "${{ inputs.cluster }}" = "all" ]; then
+            # Configure all clusters
+            for CLUSTER in jakarta bandung surabaya; do
+              if [ "$CLUSTER" = "jakarta" ]; then
+                REGION="ap-southeast-3"
+              else
+                REGION="ap-southeast-1"
+              fi
+              
+              aws eks update-kubeconfig \
+                --region ${REGION} \
+                --name nusantaramart-${CLUSTER} \
+                --alias ${CLUSTER}
+            done
+          else
+            # Single cluster
+            if [ "${{ inputs.cluster }}" = "jakarta" ]; then
+              REGION="ap-southeast-3"
+            else
+              REGION="ap-southeast-1"
+            fi
+            
+            aws eks update-kubeconfig \
+              --region ${REGION} \
+              --name nusantaramart-${{ inputs.cluster }} \
+              --alias ${{ inputs.cluster }}
+          fi
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      
+      - name: 🔙 Execute rollback
+        run: |
+          CLUSTERS="${{ inputs.cluster }}"
+          if [ "$CLUSTERS" = "all" ]; then
+            CLUSTERS="jakarta bandung surabaya"
+          fi
+          
+          for CLUSTER in $CLUSTERS; do
+            echo "🔙 Rolling back ${CLUSTER}..."
+            kubectl config use-context ${CLUSTER}
+            
+            # Get current color
+            CURRENT_COLOR=$(kubectl get svc order-service -n production \
+              -o jsonpath='{.spec.selector.version}')
+            
+            # Determine previous color
+            if [ "$CURRENT_COLOR" = "blue" ]; then
+              PREVIOUS_COLOR="green"
+            else
+              PREVIOUS_COLOR="blue"
+            fi
+            
+            echo "📊 Current: ${CURRENT_COLOR} → Rolling back to: ${PREVIOUS_COLOR}"
+            
+            # Check if previous deployment exists
+            if kubectl get deployment order-service-${PREVIOUS_COLOR} -n production &>/dev/null; then
+              echo "✅ Previous ${PREVIOUS_COLOR} deployment found"
+              
+              # Scale up previous deployment
+              kubectl scale deployment order-service-${PREVIOUS_COLOR} \
+                --replicas=6 \
+                -n production
+              
+              # Wait for ready
+              kubectl rollout status deployment/order-service-${PREVIOUS_COLOR} \
+                -n production \
+                --timeout=5m
+              
+              # Switch traffic immediately
+              ./scripts/traffic-shift.sh \
+                --service order-service \
+                --new-version ${PREVIOUS_COLOR} \
+                --weight 100
+              
+              # Scale down current (failed) deployment
+              kubectl scale deployment order-service-${CURRENT_COLOR} \
+                --replicas=0 \
+                -n production
+              
+              echo "✅ Rollback completed for ${CLUSTER}"
+            else
+              echo "⚠️ Previous deployment not found. Using Helm rollback..."
+              
+              REVISION="${{ inputs.revision }}"
+              if [ -z "$REVISION" ]; then
+                # Rollback to previous revision
+                helm rollback order-service -n production
+              else
+                # Rollback to specific revision
+                helm rollback order-service ${REVISION} -n production
+              fi
+              
+              kubectl rollout status deployment/order-service -n production --timeout=5m
+            fi
+          done
+      
+      - name: 🏥 Verify rollback health
+        run: |
+          CLUSTERS="${{ inputs.cluster }}"
+          if [ "$CLUSTERS" = "all" ]; then
+            CLUSTERS="jakarta bandung surabaya"
+          fi
+          
+          for CLUSTER in $CLUSTERS; do
+            kubectl config use-context ${CLUSTER}
+            
+            # Check pod status
+            kubectl get pods -n production -l app=order-service
+            
+            # Run health check
+            ./scripts/check-slo.sh --cluster ${CLUSTER} --duration 2m
+          done
+      
+      - name: 📝 Create incident report
+        run: |
+          cat > incident-report.md <<EOF
+          # Rollback Incident Report
+          
+          **Date:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          **Cluster:** ${{ inputs.cluster }}
+          **Reason:** ${{ inputs.reason }}
+          **Triggered by:** ${{ github.actor }}
+          **Revision:** ${{ inputs.revision || 'previous' }}
+          
+          ## Actions Taken
+          - Emergency rollback executed
+          - Traffic shifted to previous stable version
+          - Health checks passed
+          
+          ## Next Steps
+          - [ ] Root cause analysis
+          - [ ] Fix identified issues
+          - [ ] Update tests to prevent recurrence
+          - [ ] Schedule re-deployment
+          EOF
+          
+          cat incident-report.md
+
+      - name: 📤 Upload incident report
+        uses: actions/upload-artifact@v3
+        with:
+            name: incident-report
+            path: incident-report.md
+  
+      - name: ✅ Rollback complete
+        run: |
+            curl -X POST ${{ secrets.SLACK_WEBHOOK_URL }} \
+                -H 'Content-Type: application/json' \
+                -d '{
+                "text": "✅ ROLLBACK COMPLETED",
+                "blocks": [{
+                    "type": "section",
+                    "text": {
+                    "type": "mrkdwn",
+                    "text": "*Rollback Successful*\nCluster: ${{ inputs.cluster }}\nReason: ${{ inputs.reason }}\nStatus: Services restored"
+                    }
+                }]
+                }'

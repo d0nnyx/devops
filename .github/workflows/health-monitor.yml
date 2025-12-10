@@ -1,0 +1,167 @@
+name: 🏥 Health Monitor & Auto-Failover
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'  # Every 5 minutes
+  workflow_dispatch:
+
+env:
+  SLO_ERROR_RATE_THRESHOLD: 0.5  # 0.5%
+  SLO_LATENCY_P95_THRESHOLD: 300  # 300ms
+  SLO_AVAILABILITY_THRESHOLD: 99.9  # 99.9%
+  FAILOVER_THRESHOLD_MINUTES: 10  # Trigger failover after 10min down
+
+jobs:
+  health-check:
+    name: 🏥 Health Check All Regions
+    runs-on: ubuntu-latest
+    outputs:
+      jakarta_status: ${{ steps.check_jakarta.outputs.status }}
+      bandung_status: ${{ steps.check_bandung.outputs.status }}
+      surabaya_status: ${{ steps.check_surabaya.outputs.status }}
+    
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+      
+      - name: 🔧 Setup kubectl
+        run: |
+          for CLUSTER in jakarta bandung surabaya; do
+            if [ "$CLUSTER" = "jakarta" ]; then
+              REGION="ap-southeast-3"
+            else
+              REGION="ap-southeast-1"
+            fi
+            
+            aws eks update-kubeconfig \
+              --region ${REGION} \
+              --name nusantaramart-${CLUSTER} \
+              --alias ${CLUSTER}
+          done
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      
+      - name: 🏥 Check Jakarta health
+        id: check_jakarta
+        run: |
+          kubectl config use-context jakarta
+          
+          if ./scripts/check-slo.sh --cluster jakarta --duration 5m; then
+            echo "status=healthy" >> $GITHUB_OUTPUT
+            echo "✅ Jakarta: HEALTHY"
+          else
+            echo "status=unhealthy" >> $GITHUB_OUTPUT
+            echo "❌ Jakarta: UNHEALTHY"
+          fi
+      
+      - name: 🏥 Check Bandung health
+        id: check_bandung
+        run: |
+          kubectl config use-context bandung
+          
+          if ./scripts/check-slo.sh --cluster bandung --duration 5m; then
+            echo "status=healthy" >> $GITHUB_OUTPUT
+            echo "✅ Bandung: HEALTHY"
+          else
+            echo "status=unhealthy" >> $GITHUB_OUTPUT
+            echo "❌ Bandung: UNHEALTHY"
+          fi
+      
+      - name: 🏥 Check Surabaya health
+        id: check_surabaya
+        run: |
+          kubectl config use-context surabaya
+          
+          if ./scripts/check-slo.sh --cluster surabaya --duration 5m; then
+            echo "status=healthy" >> $GITHUB_OUTPUT
+            echo "✅ Surabaya: HEALTHY"
+          else
+            echo "status=unhealthy" >> $GITHUB_OUTPUT
+            echo "❌ Surabaya: UNHEALTHY"
+          fi
+  
+  auto-failover:
+    name: 🔄 Auto-Failover Decision
+    needs: health-check
+    runs-on: ubuntu-latest
+    if: |
+      needs.health-check.outputs.bandung_status == 'unhealthy' ||
+      needs.health-check.outputs.surabaya_status == 'unhealthy'
+    
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+      
+      - name: 🔍 Check failure duration
+        id: failure_duration
+        run: |
+          # Check if cluster has been down > threshold
+          CLUSTER=""
+          if [ "${{ needs.health-check.outputs.bandung_status }}" = "unhealthy" ]; then
+            CLUSTER="bandung"
+          elif [ "${{ needs.health-check.outputs.surabaya_status }}" = "unhealthy" ]; then
+            CLUSTER="surabaya"
+          fi
+          
+          # Get downtime from state file (stored in S3)
+          DOWNTIME=$(./scripts/get-downtime.sh --cluster ${CLUSTER})
+          
+          if [ ${DOWNTIME} -gt ${{ env.FAILOVER_THRESHOLD_MINUTES }} ]; then
+            echo "trigger_failover=true" >> $GITHUB_OUTPUT
+            echo "failed_cluster=${CLUSTER}" >> $GITHUB_OUTPUT
+            echo "⚠️ ${CLUSTER} down for ${DOWNTIME} minutes. Triggering failover..."
+          else
+            echo "trigger_failover=false" >> $GITHUB_OUTPUT
+            echo "ℹ️ ${CLUSTER} down for ${DOWNTIME} minutes. Below threshold."
+          fi
+      
+      - name: 🚨 Trigger failover
+        if: steps.failure_duration.outputs.trigger_failover == 'true'
+        run: |
+          FAILED_CLUSTER="${{ steps.failure_duration.outputs.failed_cluster }}"
+          
+          echo "🚨 Initiating failover for ${FAILED_CLUSTER}"
+          
+          # Execute failover script
+          ./scripts/failover.sh \
+            --failed-cluster ${FAILED_CLUSTER} \
+            --target-cluster jakarta \
+            --reason "Health check failure > ${{ env.FAILOVER_THRESHOLD_MINUTES }} minutes"
+          
+          # Update CloudFlare Load Balancer
+          curl -X PATCH "https://api.cloudflare.com/client/v4/load_balancers/${{ secrets.CF_LB_ID }}" \
+            -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            --data '{
+              "pool_ids": ["jakarta-pool"],
+              "description": "Failover: '"${FAILED_CLUSTER}"' unhealthy"
+            }'
+          
+          # Send alert
+          curl -X POST ${{ secrets.SLACK_WEBHOOK_URL }} \
+            -H 'Content-Type: application/json' \
+            -d '{
+              "text": "🚨 AUTOMATIC FAILOVER TRIGGERED",
+              "blocks": [{
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "*Failover Event*\nFailed Cluster: '"${FAILED_CLUSTER}"'\nTarget: Jakarta\nReason: Health check failure > ${{ env.FAILOVER_THRESHOLD_MINUTES }} min"
+                }
+              }]
+            }'
+          
+          # Create PagerDuty incident
+          curl -X POST https://api.pagerduty.com/incidents \
+            -H "Authorization: Token token=${{ secrets.PAGERDUTY_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "incident": {
+                "type": "incident",
+                "title": "Cluster failover - '"${FAILED_CLUSTER}"' unhealthy",
+                "service": {"id": "${{ secrets.PAGERDUTY_SERVICE_ID }}", "type": "service_reference"},
+                "urgency": "high",
+                "body": {"type": "incident_body", "details": "Automatic failover triggered due to health check failure"}
+              }
+            }'
