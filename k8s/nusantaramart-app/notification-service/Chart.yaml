@@ -1,0 +1,23 @@
+apiVersion: v2
+name: nusantaramart-app
+description: NusantaraMart microservices Helm chart with Blue-Green deployment support
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+
+maintainers:
+  - name: DevOps Team
+    email: devops@nusantaramart.com
+
+keywords:
+  - nusantaramart
+  - microservices
+  - blue-green
+  - kubernetes
+
+# Masukkan dependecies jika dibutuhkan
+dependencies:
+  - name: redis
+    version: 17.x.x
+    repository: https://charts.bitnami.com/bitnami
+    condition: redis.enabled

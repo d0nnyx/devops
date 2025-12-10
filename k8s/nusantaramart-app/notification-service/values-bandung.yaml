@@ -1,0 +1,35 @@
+# Bandung-specific overrides
+
+global:
+  region: bandung
+
+deployment:
+  replicaCount: 4
+
+resources:
+  limits:
+    cpu: 2000m
+    memory: 4Gi
+  requests:
+    cpu: 1000m
+    memory: 2Gi
+
+autoscaling:
+  minReplicas: 3
+  maxReplicas: 12
+
+nodeSelector:
+  workload: general
+
+env:
+  - name: AWS_REGION
+    value: "ap-southeast-1"
+  
+  - name: DATABASE_PROXY_ENDPOINT
+    value: "nusantaramart-replica-bdg.xxxxxxxx.ap-southeast-1.rds.amazonaws.com"
+  
+  - name: REDIS_ENDPOINT
+    value: "nusantaramart-redis-bdg.xxxxxx.apse1.cache.amazonaws.com"
+  
+  - name: WRITE_ENDPOINT
+    value: "https://api-internal.jakarta.nusantaramart.com"
