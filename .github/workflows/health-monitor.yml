@@ -1,8 +1,9 @@
 name: 🏥 Health Monitor & Auto-Failover
 
 on:
-  schedule:
-    - cron: '*/5 * * * *'  # Every 5 minutes
+  # Menggunakan schedule untuk pipeline ini sementara di disable
+  # schedule:
+  #   - cron: '*/5 * * * *'  # Every 5 minutes
   workflow_dispatch:
 
 env:

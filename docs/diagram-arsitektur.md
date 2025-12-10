@@ -1,3 +1,4 @@
+```mermaid
 flowchart TD
 
 %% ===== CLIENT & CLOUDFLARE =====
@@ -207,3 +208,4 @@ style SREDIS fill:#95e1d3
 style JMS fill:#a8e6cf
 style BMS fill:#a8e6cf
 style SMS fill:#a8e6cf
+```

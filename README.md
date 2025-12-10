@@ -1,4 +1,4 @@
 # BIODATA DIRI
 Halo perkenalkan nama saya Donny Ramdani, saat ini saya berdomisili di Bandung. Secara singkat , pengalaman yang saya miliki saat ini membangun proses dan budaya DevSecOps diberbagai instansi BUMN. selain itu saya menjadi arsitek dalam membangun infrastruktur yang dibutuhkan oleh client dan tim developer agar memenuhi kebutuhan aplikasi yang sedang dibangun. adapun tools yang sering digunakan untuk automation pipeline menggunakan gitlab ci. ada juga menggunakan github actions ataupun jenkins. implementasi DevSecOps lebih banyak dalam penggunaan On-Premise.
 
-Saat ini untuk pengalaman berkaitan dengan cloud computing untuk case kompleks belum pernah melakukannya, pengalaman penggunaan cloud baru menggunakan aws lighstail.
+Saat ini untuk pengalaman berkaitan dengan cloud computing untuk case kompleks belum pernah melakukannya, pengalaman penggunaan cloud baru menggunakan aws lighstail. jawaban yang sudah dilampirkan merupakan jawaban berdasarkan hasil research dan belum adanya test atau percobaan.

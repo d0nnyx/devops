@@ -60,13 +60,14 @@ jobs:
       - name: 🏷️ Generate version
         id: version
         run: |
+          SERVICE="${{ github.event.inputs.service }}"
           if [ -n "${{ inputs.version }}" ]; then
             VERSION="${{ inputs.version }}"
           else
             # Auto-generate: v{major}.{minor}.{patch}-{short-sha}
             VERSION="v1.0.${GITHUB_RUN_NUMBER}-${GITHUB_SHA::8}"
           fi
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "version=${SERVICE}_${VERSION}" >> $GITHUB_OUTPUT
           echo "📦 Version: ${VERSION}"
       
       - name: 🐳 Set up Docker Buildx
@@ -83,7 +84,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/order-service
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${{ github.event.inputs.service }}
           tags: |
             type=ref,event=branch
             type=sha,prefix={{branch}}-
@@ -92,8 +93,9 @@ jobs:
       
       - name: 🧪 Run unit tests
         run: |
+          SERVICE="${{ github.event.inputs.service }}"
           echo "disini step untuk testing, dibawah contoh menggunakan npm"
-          cd src/order-service
+          cd src/${SERVICE}
           npm install
           npm run test:unit
           npm run test:coverage
@@ -101,7 +103,7 @@ jobs:
       - name: 📊 Upload coverage
         uses: codecov/codecov-action@v3
         with:
-          files: ./src/order-service/coverage/lcov.info
+          files: ./src/${{ github.event.inputs.service }}/coverage/lcov.info
           flags: unittests
           fail_ci_if_error: true
       
@@ -109,7 +111,7 @@ jobs:
         id: build
         uses: docker/build-push-action@v5
         with:
-          context: ./src/order-service
+          context: ./src/${{ github.event.inputs.service }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -182,7 +184,8 @@ jobs:
       - name: 🔍 Validate Kubernetes manifests
         run: |
           # Render Helm templates
-          helm template nusantaramart ./helm/nusantaramart-app \
+          SERVICE="${{ github.event.inputs.service }}"
+          helm template nusantaramart ./helm/nusantaramart-app/${SERVICE} \
             --set image.tag=${{ needs.build-and-test.outputs.version }} \
             > rendered-manifests.yaml
           
@@ -234,8 +237,9 @@ jobs:
       - name: 🔍 Check current deployment color
         id: current_color
         run: |
+          SERVICE="${{ github.event.inputs.service }}"
           # Get current active color
-          CURRENT=$(kubectl get service order-service -n production \
+          CURRENT=$(kubectl get service ${SERVICE} -n production \
             -o jsonpath='{.spec.selector.version}' || echo "blue")
           
           # Determine new color
@@ -252,11 +256,12 @@ jobs:
       - name: 🚀 Deploy ${{ steps.current_color.outputs.new }} version
         run: |
           NEW_COLOR="${{ steps.current_color.outputs.new }}"
+          SERVICE="${{ github.event.inputs.service }}"
           
-          helm upgrade --install order-service-${NEW_COLOR} ./helm/nusantaramart-app \
+          helm upgrade --install ${SERVICE}-${NEW_COLOR} ./helm/nusantaramart-app/${SERVICE} \
             --namespace production \
             --create-namespace \
-            --values ./helm/nusantaramart-app/values-${{ matrix.cluster }}.yaml \
+            --values ./helm/nusantaramart-app/${SERVICE}/values-${{ matrix.cluster }}.yaml \
             --set image.tag=${{ needs.build-and-test.outputs.version }} \
             --set deployment.color=${NEW_COLOR} \
             --set replicaCount=4 \
@@ -266,15 +271,16 @@ jobs:
       - name: 🏥 Health check ${{ steps.current_color.outputs.new }} deployment
         run: |
           NEW_COLOR="${{ steps.current_color.outputs.new }}"
+          SERVICE="${{ github.event.inputs.service }}"
           
           # Wait for rollout
-          kubectl rollout status deployment/order-service-${NEW_COLOR} \
+          kubectl rollout status deployment/${SERVICE}-${NEW_COLOR} \
             -n production \
             --timeout=5m
           
           # Check pod health
           kubectl wait --for=condition=ready pod \
-            -l app=order-service,version=${NEW_COLOR} \
+            -l app=${SERVICE},version=${NEW_COLOR} \
             -n production \
             --timeout=5m
       
@@ -283,37 +289,39 @@ jobs:
           NEW_COLOR="${{ steps.current_color.outputs.new }}"
           
           # Get service endpoint (internal)
-          ENDPOINT=$(kubectl get svc order-service-${NEW_COLOR} -n production \
+          ENDPOINT=$(kubectl get svc ${SERVICE}-${NEW_COLOR} -n production \
             -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
           
           # Health check
           curl -f http://${ENDPOINT}:8080/health || exit 1
           
           # Basic API test
-          curl -f http://${ENDPOINT}:8080/api/v1/orders || exit 1
+          curl -f http://${ENDPOINT}:8080/api/v1/${SERVICE} || exit 1
           
           echo "✅ Smoke tests passed"
       
       - name: 📊 Monitor metrics for 5 minutes
         run: |
+          SERVICE="${{ github.event.inputs.service }}"
           echo "⏳ Monitoring ${{ steps.current_color.outputs.new }} deployment for 5 minutes..."
           sleep 300
           
           # Check SLO metrics
           ./scripts/check-slo.sh \
             --namespace production \
-            --deployment order-service-${{ steps.current_color.outputs.new }} \
+            --deployment ${SERVICE}-${{ steps.current_color.outputs.new }} \
             --duration 5m
       
       - name: ↔️ Traffic shift to ${{ steps.current_color.outputs.new }} (10% → 50% → 100%)
         run: |
           NEW_COLOR="${{ steps.current_color.outputs.new }}"
           OLD_COLOR="${{ steps.current_color.outputs.current }}"
-          
+          SERVICE="${{ github.event.inputs.service }}"
+
           echo "🔄 Phase 1: Route 10% traffic to ${NEW_COLOR}"
           ./scripts/traffic-shift.sh \
             --namespace production \
-            --service order-service \
+            --service ${SERVICE} \
             --new-version ${NEW_COLOR} \
             --old-version ${OLD_COLOR} \
             --weight 10
@@ -321,33 +329,33 @@ jobs:
           sleep 180  # Monitor for 3 minutes
           
           # Check metrics
-          if ! ./scripts/check-slo.sh --deployment order-service-${NEW_COLOR} --duration 3m; then
+          if ! ./scripts/check-slo.sh --deployment ${SERVICE}-${NEW_COLOR} --duration 3m; then
             echo "❌ SLO breach detected at 10%! Rolling back..."
             exit 1
           fi
           
           echo "🔄 Phase 2: Route 50% traffic to ${NEW_COLOR}"
           ./scripts/traffic-shift.sh \
-            --service order-service \
+            --service ${SERVICE} \
             --new-version ${NEW_COLOR} \
             --weight 50
           
           sleep 300  # Monitor for 5 minutes
           
-          if ! ./scripts/check-slo.sh --deployment order-service-${NEW_COLOR} --duration 5m; then
+          if ! ./scripts/check-slo.sh --deployment ${SERVICE}-${NEW_COLOR} --duration 5m; then
             echo "❌ SLO breach at 50%! Rolling back..."
             exit 1
           fi
           
           echo "🔄 Phase 3: Route 100% traffic to ${NEW_COLOR}"
           ./scripts/traffic-shift.sh \
-            --service order-service \
+            --service ${SERVICE} \
             --new-version ${NEW_COLOR} \
             --weight 100
           
           sleep 300  # Final monitoring
           
-          if ! ./scripts/check-slo.sh --deployment order-service-${NEW_COLOR} --duration 5m; then
+          if ! ./scripts/check-slo.sh --deployment ${SERVICE}-${NEW_COLOR} --duration 5m; then
             echo "❌ SLO breach at 100%! Rolling back..."
             exit 1
           fi
@@ -357,9 +365,10 @@ jobs:
       - name: 🧹 Cleanup old ${{ steps.current_color.outputs.current }} deployment
         run: |
           OLD_COLOR="${{ steps.current_color.outputs.current }}"
+          SERVICE="${{ github.event.inputs.service }}"
           
           # Scale down old deployment
-          kubectl scale deployment order-service-${OLD_COLOR} \
+          kubectl scale deployment ${SERVICE}-${OLD_COLOR} \
             --replicas=0 \
             -n production
           
@@ -368,15 +377,16 @@ jobs:
           sleep 600
           
           # Delete old deployment
-          helm uninstall order-service-${OLD_COLOR} -n production || true
+          helm uninstall ${SERVICE}-${OLD_COLOR} -n production || true
           
           echo "🗑️ Old ${OLD_COLOR} deployment cleaned up"
       
       - name: 🔄 Update deployment tags
         run: |
           NEW_COLOR="${{ steps.current_color.outputs.new }}"
+          SERVICE="${{ github.event.inputs.service }}"
           
-          kubectl label deployment order-service-${NEW_COLOR} \
+          kubectl label deployment ${SERVICE}-${NEW_COLOR} \
             active=true \
             version=${{ needs.build-and-test.outputs.version }} \
             -n production \
@@ -389,15 +399,16 @@ jobs:
           
           OLD_COLOR="${{ steps.current_color.outputs.current }}"
           NEW_COLOR="${{ steps.current_color.outputs.new }}"
+          SERVICE="${{ github.event.inputs.service }}"
           
           # Route 100% back to old version
           ./scripts/traffic-shift.sh \
-            --service order-service \
+            --service ${SERVICE} \
             --new-version ${OLD_COLOR} \
             --weight 100
           
           # Scale down failed deployment
-          kubectl scale deployment order-service-${NEW_COLOR} \
+          kubectl scale deployment ${SERVICE}-${NEW_COLOR} \
             --replicas=0 \
             -n production
           
@@ -435,7 +446,7 @@ jobs:
       - name: ⏸️ Manual approval checkpoint
         uses: trstringer/manual-approval@v1
         with:
-          secret: ${{ github.TOKEN }}
+          secret: ${{ secrets.GITHUB_TOKEN }}
           approvers: platform-team,devops-leads
           minimum-approvals: 2
           issue-title: "🚀 Deploy to Jakarta Main Cluster"
@@ -473,7 +484,8 @@ jobs:
       - name: 🔍 Check current deployment color
         id: current_color
         run: |
-          CURRENT=$(kubectl get service order-service -n production \
+          SERVICE="${{ github.event.inputs.service }}"
+          CURRENT=$(kubectl get service ${SERVICE} -n production \
             -o jsonpath='{.spec.selector.version}' || echo "blue")
           
           if [ "$CURRENT" = "blue" ]; then
@@ -489,11 +501,12 @@ jobs:
       - name: 🚀 Deploy ${{ steps.current_color.outputs.new }} version (Jakarta)
         run: |
           NEW_COLOR="${{ steps.current_color.outputs.new }}"
+          SERVICE="${{ github.event.inputs.service }}"
           
-          helm upgrade --install order-service-${NEW_COLOR} ./helm/nusantaramart-app \
+          helm upgrade --install ${SERVICE}-${NEW_COLOR} ./helm/nusantaramart-app/${SERVICE} \
             --namespace production \
             --create-namespace \
-            --values ./helm/nusantaramart-app/values-jakarta.yaml \
+            --values ./helm/nusantaramart-app/${SERVICE}/values-jakarta.yaml \
             --set image.tag=${{ needs.build-and-test.outputs.version }} \
             --set deployment.color=${NEW_COLOR} \
             --set replicaCount=6 \
@@ -503,40 +516,44 @@ jobs:
       - name: 🏥 Health check
         run: |
           NEW_COLOR="${{ steps.current_color.outputs.new }}"
+          SERVICE="${{ github.event.inputs.service }}"
           
-          kubectl rollout status deployment/order-service-${NEW_COLOR} -n production --timeout=5m
+          kubectl rollout status deployment/${SERVICE}-${NEW_COLOR} -n production --timeout=5m
           kubectl wait --for=condition=ready pod \
-            -l app=order-service,version=${NEW_COLOR} \
+            -l app=${SERVICE},version=${NEW_COLOR} \
             -n production \
             --timeout=5m
       
       - name: 🧪 Run smoke tests
         run: |
           NEW_COLOR="${{ steps.current_color.outputs.new }}"
-          ENDPOINT=$(kubectl get svc order-service-${NEW_COLOR} -n production \
+          SERVICE="${{ github.event.inputs.service }}"
+          ENDPOINT=$(kubectl get svc ${SERVICE}-${NEW_COLOR} -n production \
             -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
           
           curl -f http://${ENDPOINT}:8080/health || exit 1
-          ./scripts/smoke-test.sh ${ENDPOINT}
+          ./scripts/smoke-test.sh ${ENDPOINT} ${SERVICE}
       
       - name: 📊 Monitor metrics for 10 minutes
         run: |
           echo "⏳ Monitoring deployment for 10 minutes..."
+          SERVICE="${{ github.event.inputs.service }}"
           sleep 600
           ./scripts/check-slo.sh \
-            --deployment order-service-${{ steps.current_color.outputs.new }} \
+            --deployment ${SERVICE}-${{ steps.current_color.outputs.new }} \
             --duration 10m
       
       - name: ↔️ Gradual traffic shift (10% → 25% → 50% → 75% → 100%)
         run: |
           NEW_COLOR="${{ steps.current_color.outputs.new }}"
           OLD_COLOR="${{ steps.current_color.outputs.current }}"
+          SERVICE="${{ github.event.inputs.service }}"
           
           for WEIGHT in 10 25 50 75 100; do
             echo "🔄 Shifting ${WEIGHT}% traffic to ${NEW_COLOR}"
             
             ./scripts/traffic-shift.sh \
-              --service order-service \
+              --service ${SERVICE} \
               --new-version ${NEW_COLOR} \
               --weight ${WEIGHT}
             
@@ -547,7 +564,7 @@ jobs:
             
             # Check SLO
             if ! ./scripts/check-slo.sh \
-              --deployment order-service-${NEW_COLOR} \
+              --deployment ${SERVICE}-${NEW_COLOR} \
               --duration ${WAIT_TIME}s; then
               echo "❌ SLO breach at ${WEIGHT}%! Rolling back..."
               exit 1
@@ -559,9 +576,10 @@ jobs:
       - name: 🧹 Cleanup old deployment
         run: |
           OLD_COLOR="${{ steps.current_color.outputs.current }}"
-          kubectl scale deployment order-service-${OLD_COLOR} --replicas=0 -n production
+          SERVICE="${{ github.event.inputs.service }}"
+          kubectl scale deployment ${SERVICE}-${OLD_COLOR} --replicas=0 -n production
           sleep 600
-          helm uninstall order-service-${OLD_COLOR} -n production || true
+          helm uninstall ${SERVICE}-${OLD_COLOR} -n production || true
       
       - name: ✅ Deployment successful
         run: |
